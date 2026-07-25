@@ -1,0 +1,14 @@
+[Unit]
+Description=Windows-style middle-click autoscroll (any mouse, Wayland)
+After=systemd-udevd.service
+
+[Service]
+# @UID@ is replaced by install.sh with the desktop user's UID - the daemon reads
+# the active-window state file from that user's XDG_RUNTIME_DIR.
+Environment=AUTOSCROLL_UID=@UID@
+ExecStart=/usr/local/bin/autoscroll-daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

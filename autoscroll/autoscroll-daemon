@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""Windows-style middle-click autoscroll for Wayland - any mouse, system-wide.
+
+WHY A DAEMON
+    libinput's button scrolling (ScrollMethod=4) is a different feature: delta-based,
+    so it stops the moment you stop moving, and it freezes the cursor. Windows
+    autoscroll is displacement-proportional - the cursor moves freely and the page
+    scrolls CONTINUOUSLY at a speed set by how far the cursor sits from the anchor.
+    No toolkit setting or general-purpose remapper can express that (they map
+    delta->delta); it needs a timer integrating displacement. Hence this.
+
+ARCHITECTURE
+    grabs every mouse           mirrors events            injects wheel
+    any mouse --evdev grab--> this daemon --uinput--> clone + wheel --> compositor
+                                   ^
+                                   | reads at each middle-press
+    KWin script --DBus--> helper.py --> $XDG_RUNTIME_DIR/autoscroll-active-class
+
+    Apps with NATIVE autoscroll (Chromium's --enable-blink-features=
+    MiddleClickAutoscroll, Firefox's general.autoScroll) get the button passed
+    through untouched - their in-app implementation has the anchor icon, origin
+    capture and link hit-testing that injection can never match. The daemon covers
+    everything else (Qt, GTK, terminals, PDF viewers).
+
+HARD-WON DESIGN NOTES - each fixes a bug that shipped and hurt
+    * TWO uinput devices per concern: per-device CLONE mirrors the grabbed mouse,
+      one shared WHEEL injector emits scroll. Writing wheel into the clone let the
+      60 Hz ticker interleave into a forwarded packet and corrupt SYN framing.
+    * KERNEL GROUND TRUTH: a 1000 Hz mouse can overflow the kernel queue, which
+      silently drops events (incl. button releases) and emits SYN_DROPPED. Never
+      trust remembered button state: reconcile against the active_keys() ioctl
+      every frame, and rebuild state whenever SYN_DROPPED arrives. A stale held
+      flag self-heals in 16 ms instead of freezing the cursor forever.
+    * SETTLE BEFORE GRAB: libinput needs a beat to open a new uinput node; grab
+      too early and events vanish into the gap.
+    * WATCHDOG THREAD: plain OS thread checking a ticker heartbeat. If the asyncio
+      loop wedges while holding grabs, it force-ungrabs everything and hard-exits.
+      (An asyncio-based timeout guards nothing when the loop itself is stuck.)
+      SIGKILL is always safe: the kernel drops grabs when the fd closes.
+
+MODES
+    default   grab + mirror every mouse. Middle click suppressed during gestures.
+    --safe    no grabs, wheel injection only. Cannot affect input, but the middle
+              click is not suppressed (paste / open-in-new-tab fire alongside).
+"""
+import argparse, asyncio, os, signal, subprocess, sys, threading, time
+import evdev
+from evdev import ecodes as e
+
+# Apps whose own autoscroll should win. Substring match on KWin resourceClass.
+NATIVE_APPS = ("brave", "firefox", "claude", "chrome", "chromium")
+STATE_FILE = os.path.join(
+    f"/run/user/{os.environ.get('SUDO_UID') or os.environ.get('AUTOSCROLL_UID') or 1000}",
+    "autoscroll-active-class")
+
+# feel tuning (overridable on the command line)
+#     norm = clamp((|off| - DEADZONE) / RANGE, 0..1)
+#     notches_per_frame = MAX_RATE * norm ** CURVE
+DEADZONE   = 8       # px of slack before scrolling starts
+RANGE      = 250.0   # px of travel from deadzone to full speed
+MAX_RATE   = 1.2     # notches per frame at full deflection (~72/sec)
+CURVE      = 1.4     # 1 = linear, higher = finer control near the anchor
+FRAME      = 0.016   # ~60 Hz
+CLICK_SLOP = 6       # px still counted as "a click, not a drag"
+CLICK_TIME = 0.35    # s; longer is a drag even without motion
+STALL      = 2.0     # s without a ticker heartbeat = loop wedged
+RESCAN     = 2.0     # s between hotplug scans
+
+
+def active_class():
+    try:
+        with open(STATE_FILE) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def is_mouse(dev):
+    """A device we should manage: relative X/Y motion plus a middle button.
+    Our own uinput nodes are excluded by name, or grabbing the clone would
+    feed the daemon its own output."""
+    if "autoscroll" in dev.name.lower():
+        return False
+    caps = dev.capabilities()
+    rel = caps.get(e.EV_REL, [])
+    keys = caps.get(e.EV_KEY, [])
+    return e.REL_X in rel and e.REL_Y in rel and e.BTN_MIDDLE in keys
+
+
+async def settle():
+    """Give udev/libinput time to open freshly created uinput nodes."""
+    try:
+        subprocess.run(["udevadm", "settle", "--timeout=3"], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+    await asyncio.sleep(0.5)
+
+
+class Mouse:
+    """One managed pointer device: its clone, its gesture state, its pump task."""
+
+    def __init__(self, dev, grab):
+        self.dev = dev
+        self.grab = grab
+        self.clone = evdev.UInput.from_device(dev, name="autoscroll-clone") if grab else None
+        self.grabbed = False
+        self.task = None
+        self.st = {"held": False, "native": False, "off": 0, "travel": 0,
+                   "t0": 0.0, "accum": 0.0, "hires": 0.0}
+
+    def release(self):
+        if self.task:
+            self.task.cancel()
+        if self.grabbed:
+            try: self.dev.ungrab()
+            except Exception: pass
+            self.grabbed = False
+        if self.clone:
+            try: self.clone.close()
+            except Exception: pass
+        try: self.dev.close()
+        except Exception: pass
+
+
+async def run(args):
+    grab = not args.safe
+    tune = dict(deadzone=args.deadzone, range=args.range,
+                max_rate=args.max_rate, curve=args.curve)
+    debug, freeze = args.debug, args.freeze
+
+    wheel = evdev.UInput({e.EV_REL: [e.REL_WHEEL, e.REL_WHEEL_HI_RES]},
+                         name="autoscroll-wheel")
+    mice = {}                     # path -> Mouse
+    hb = {"t": time.monotonic()}
+    stop = asyncio.Event()
+
+    # --- watchdog: the only guard that works when the event loop itself dies ---
+    def watchdog():
+        while True:
+            time.sleep(0.5)
+            if (time.monotonic() - hb["t"]) > STALL:
+                sys.stderr.write("!! event loop wedged - ungrabbing all, hard exit\n")
+                sys.stderr.flush()
+                for m in list(mice.values()):
+                    if m.grabbed:
+                        try: m.dev.ungrab()
+                        except Exception: pass
+                os._exit(3)
+    threading.Thread(target=watchdog, daemon=True).start()
+
+    async def guard(coro, label):
+        try:
+            await coro
+        except asyncio.CancelledError:
+            raise
+        except OSError:
+            return                 # device unplugged; rescan cleans up
+        except Exception:
+            import traceback
+            print(f"!! {label} FAILED:", flush=True); traceback.print_exc()
+            stop.set()
+
+    async def pump(m):
+        st, dev, clone = m.st, m.dev, m.clone
+        async for ev in dev.async_read_loop():
+            if stop.is_set():
+                break
+            if ev.type == e.EV_SYN and ev.code == e.SYN_DROPPED:
+                st["held"] = e.BTN_MIDDLE in dev.active_keys()
+                if not st["held"]:
+                    st["off"] = 0
+                if debug:
+                    print(f"[resync] {dev.name}: SYN_DROPPED, kernel held={st['held']}",
+                          flush=True)
+                continue
+            if ev.type == e.EV_KEY and ev.code == e.BTN_MIDDLE:
+                if ev.value == 1:
+                    cls = active_class()
+                    if any(k in cls for k in NATIVE_APPS):
+                        st["native"] = True   # app's own autoscroll wins; mirror it
+                        if debug: print(f"[mid] press ({cls}) -> NATIVE passthrough", flush=True)
+                    else:
+                        if debug: print(f"[mid] press ({cls}) -> gesture", flush=True)
+                        st.update(held=True, off=0, travel=0, t0=time.monotonic(),
+                                  accum=0.0, hires=0.0)
+                        if grab:
+                            continue          # swallow; replayed on release if a click
+                elif ev.value == 0:
+                    if st["native"]:
+                        st["native"] = False  # mirror the release verbatim
+                    else:
+                        was, st["held"] = st["held"], False
+                        quick = (time.monotonic() - st["t0"]) < CLICK_TIME
+                        replay = was and quick and st["travel"] <= CLICK_SLOP
+                        if debug:
+                            print(f"[mid] release travel={st['travel']}px -> "
+                                  f"{'REPLAY CLICK' if replay else 'swallowed'}", flush=True)
+                        if grab:
+                            if replay:
+                                clone.write(e.EV_KEY, e.BTN_MIDDLE, 1); clone.syn()
+                                clone.write(e.EV_KEY, e.BTN_MIDDLE, 0); clone.syn()
+                            continue
+            elif ev.type == e.EV_REL and st["held"]:
+                if ev.code == e.REL_Y:
+                    st["off"] += ev.value
+                    st["travel"] += abs(ev.value)
+                elif ev.code == e.REL_X:
+                    st["travel"] += abs(ev.value)
+                if grab and freeze and ev.code in (e.REL_X, e.REL_Y):
+                    continue                  # opt-in: pin cursor during gesture
+            if grab:
+                clone.write(ev.type, ev.code, ev.value)
+
+    async def ticker():
+        while not stop.is_set():
+            await asyncio.sleep(FRAME)
+            hb["t"] = time.monotonic()
+            for m in mice.values():
+                st = m.st
+                if not st["held"]:
+                    continue
+                # kernel ground truth: a lost release self-heals here in one frame
+                if e.BTN_MIDDLE not in m.dev.active_keys():
+                    st["held"] = False
+                    if debug:
+                        print(f"[resync] {m.dev.name}: stale held flag cleared", flush=True)
+                    continue
+                mag = abs(st["off"]) - tune["deadzone"]
+                if mag <= 0:
+                    continue
+                norm = min(mag / tune["range"], 1.0)
+                rate = tune["max_rate"] * (norm ** tune["curve"])
+                signed = -rate if st["off"] > 0 else rate   # below anchor = scroll down
+                st["hires"] += signed * 120.0
+                st["accum"] += signed
+                hi, notches = int(st["hires"]), int(st["accum"])
+                if hi:
+                    st["hires"] -= hi
+                    wheel.write(e.EV_REL, e.REL_WHEEL_HI_RES, hi)
+                if notches:
+                    st["accum"] -= notches
+                    wheel.write(e.EV_REL, e.REL_WHEEL, notches)
+                if hi or notches:
+                    wheel.syn()
+
+    async def adopt(path):
+        try:
+            dev = evdev.InputDevice(path)
+        except OSError:
+            return
+        if not is_mouse(dev):
+            dev.close(); return
+        if args.name and args.name.lower() not in dev.name.lower():
+            dev.close(); return
+        m = Mouse(dev, grab)
+        if grab:
+            await settle()
+            dev.grab(); m.grabbed = True
+        m.task = asyncio.create_task(guard(pump(m), f"pump:{dev.name}"))
+        mice[path] = m
+        print(f":: managing {dev.name} ({path}){' [grabbed]' if grab else ''}", flush=True)
+
+    async def rescan():
+        """Hotplug: adopt new mice, drop vanished ones."""
+        while not stop.is_set():
+            present = set(evdev.list_devices())
+            for path in list(mice):
+                if path not in present:
+                    print(f":: unplugged {mice[path].dev.name}", flush=True)
+                    mice.pop(path).release()
+            for path in present - set(mice):
+                await adopt(path)
+            await asyncio.sleep(RESCAN)
+
+    async def timebox():
+        if args.seconds:
+            await asyncio.sleep(args.seconds)
+            print(f":: --seconds {args.seconds} elapsed", flush=True)
+            stop.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, stop.set)
+    if args.seconds:                          # kernel-delivered backstop
+        signal.signal(signal.SIGALRM, lambda *_: stop.set())
+        signal.alarm(args.seconds + 3)
+
+    tasks = [asyncio.create_task(guard(c, n)) for c, n in
+             ((ticker(), "ticker"), (rescan(), "rescan"), (timebox(), "timebox"))]
+    mode = "SAFE (no grabs)" if args.safe else "GRAB"
+    print(f":: {mode} mode, wheel={wheel.device.path}", flush=True)
+    await stop.wait()
+    signal.alarm(0)
+    for t in tasks:
+        t.cancel()
+    for m in list(mice.values()):
+        m.release()
+    wheel.close()
+    print(":: released all devices, input back to normal", flush=True)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--name", default=None,
+                    help="only manage devices whose name contains this substring "
+                         "(default: every mouse, hotplug included)")
+    ap.add_argument("--seconds", type=int, default=0, help="auto-exit after N seconds")
+    ap.add_argument("--safe", action="store_true", help="do not grab; inject wheel only")
+    ap.add_argument("--freeze", action="store_true",
+                    help="pin the cursor during gestures (default: free cursor, "
+                         "the Windows behaviour)")
+    ap.add_argument("--debug", action="store_true", help="log every decision")
+    ap.add_argument("--list", action="store_true")
+    ap.add_argument("--deadzone", type=float, default=DEADZONE)
+    ap.add_argument("--range", type=float, default=RANGE)
+    ap.add_argument("--max-rate", type=float, default=MAX_RATE)
+    ap.add_argument("--curve", type=float, default=CURVE)
+    a = ap.parse_args()
+
+    if a.list:
+        for p in evdev.list_devices():
+            d = evdev.InputDevice(p)
+            tag = "  [mouse]" if is_mouse(d) else ""
+            print(f"  {p}  {d.name}{tag}")
+            d.close()
+        return
+    if os.geteuid() != 0:
+        sys.exit("error: needs root for /dev/uinput and evdev grabs")
+    asyncio.run(run(a))
+
+
+if __name__ == "__main__":
+    main()

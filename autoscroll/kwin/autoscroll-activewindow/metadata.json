@@ -1,0 +1,12 @@
+{
+    "KPlugin": {
+        "Id": "autoscroll-activewindow",
+        "Name": "Autoscroll Active Window Reporter",
+        "Description": "Reports the active window class over DBus so the autoscroll daemon can stand down in apps with native autoscroll",
+        "Authors": [{ "Name": "bewinxed" }],
+        "Version": "1.0"
+    },
+    "X-Plasma-API": "javascript",
+    "X-Plasma-MainScript": "code/main.js",
+    "KPackageStructure": "KWin/Script"
+}
