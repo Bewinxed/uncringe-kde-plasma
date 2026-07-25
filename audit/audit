@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# audit - scan for unused/misconfigured drivers, devices and services, with
+# verdicts that separate real findings from things that only LOOK broken.
+#
+# Encodes the false alarms so they never get chased again:
+#   * "UNCLAIMED" AMD host bridges / data-fabric / dummy functions are NORMAL
+#     on Zen 4 platforms - placeholders with nothing to bind.
+#   * GPUs idling at PCIe gen1 / low watts is ASPM power management, not a
+#     stuck link. Judge link speed under load only.
+#   * nvidia persistence_mode reading "Disabled" while nvidia-persistenced is
+#     active is CORRECT - the daemon supersedes the legacy per-GPU flag.
+#   * A "TI serial device" that is bDeviceClass 9 is a TUSB80xx USB HUB, not a
+#     radio - do not assume Zigbee sticks from vendor IDs.
+#
+# Usage:  audit          # report only
+#         audit --fix    # also apply the safe subset (disable VM guest agents
+#                        # on bare metal)
+set -uo pipefail
+FIX=${1:-}
+
+say()  { printf '%s\n' "$*"; }
+find_() { printf '  \033[33mFINDING\033[0m %s\n' "$*"; }
+ok()   { printf '  ok      %s\n' "$*"; }
+
+say "== virtualization context =="
+VIRT=$(systemd-detect-virt 2>/dev/null || echo unknown)
+say "  running on: $VIRT"
+
+say; say "== VM guest agents on bare metal =="
+if [[ $VIRT == none ]]; then
+  for unit in spice-vdagent qemu-guest-agent open-vm-tools vboxadd-service; do
+    for scope in "--user" ""; do
+      state=$(systemctl $scope is-enabled "$unit.service" 2>/dev/null)
+      if [[ $state == enabled ]]; then
+        find_ "$unit (${scope:-system}) enabled on bare metal - dead weight"
+        if [[ $FIX == --fix ]]; then
+          systemctl $scope disable --now "$unit.service" 2>/dev/null && say "          -> disabled"
+        fi
+      fi
+    done
+  done
+else
+  ok "virtualized ($VIRT) - guest agents belong here"
+fi
+
+say; say "== PCI devices without drivers (benign bridge classes filtered) =="
+lspci -k 2>/dev/null | awk '
+  /^[0-9a-f]/ { if (dev != "" && !claimed) pending[dev]=1; dev=$0; claimed=0 }
+  /Kernel driver in use/ { claimed=1 }
+  END { if (dev != "" && !claimed) pending[dev]=1
+        for (d in pending) print d }' | \
+while read -r d; do
+  case $d in
+    *"Host bridge"*|*"Dummy"*|*"Data Fabric"*|*"Non-Essential Instrumentation"*|*"ISA bridge"*|*"IOMMU"*) ;;
+    *) find_ "unclaimed: $d" ;;
+  esac
+done
+ok "AMD dummy/fabric/host bridges filtered as normal"
+
+say; say "== missing firmware =="
+FW=$( (dmesg 2>/dev/null || sudo -n dmesg 2>/dev/null) | grep -icE 'firmware.*(fail|missing|not found)' )
+[[ ${FW:-0} -gt 0 ]] && find_ "$FW firmware complaint(s) in dmesg" || ok "no firmware complaints (run as root for certainty)"
+
+say; say "== wired NICs dark while traffic rides Wi-Fi =="
+WIFI_UP=0; WIRED_DOWN=()
+for i in /sys/class/net/*/; do
+  n=$(basename "$i")
+  [[ $n == lo || $n == podman* || $n == veth* || $n == virbr* || $n == docker* ]] && continue
+  st=$(cat "$i/operstate" 2>/dev/null)
+  if [[ -d $i/wireless ]]; then [[ $st == up ]] && WIFI_UP=1
+  else [[ $st == down ]] && WIRED_DOWN+=("$n ($(basename "$(readlink "$i/device/driver" 2>/dev/null)" 2>/dev/null))")
+  fi
+done
+if [[ $WIFI_UP -eq 1 && ${#WIRED_DOWN[@]} -gt 0 ]]; then
+  find_ "on Wi-Fi while wired port(s) sit dark: ${WIRED_DOWN[*]}"
+  say "          (10GbE 'atlantic' or 2.5GbE 'igc' beats any Wi-Fi link for LAN latency)"
+else
+  ok "network topology sane"
+fi
+
+say; say "== bluetooth: consumers without hardware =="
+if [[ ! -d /sys/class/bluetooth ]] && pgrep -x kdeconnectd >/dev/null 2>&1; then
+  find_ "no BT hardware, but kdeconnectd polls BlueZ (25s dbus timeout each try)"
+  say "          (Wi-Fi card BT half not enumerating? Check BIOS / M.2 USB lines)"
+else
+  ok "bluetooth consumers match hardware"
+fi
+
+say; say "== NVIDIA sanity =="
+if command -v nvidia-smi >/dev/null 2>&1; then
+  nvidia-smi --query-gpu=index,name,utilization.gpu,power.draw --format=csv,noheader | sed 's/^/  /'
+  if systemctl is-active -q nvidia-persistenced 2>/dev/null; then
+    ok "nvidia-persistenced active (per-GPU 'Persistence: Disabled' is fine - daemon supersedes it)"
+  fi
+  for s in nvidia-suspend nvidia-resume nvidia-hibernate; do
+    [[ $(systemctl is-enabled $s.service 2>/dev/null) == enabled ]] || find_ "$s not enabled (sleep/wake risk)"
+  done
+  grep -qs 'PreserveVideoMemoryAllocations: 1' /proc/driver/nvidia/params \
+    && ok "PreserveVideoMemoryAllocations=1" \
+    || find_ "NVreg_PreserveVideoMemoryAllocations not set (wake-from-sleep risk)"
+fi
+
+say; say "== libvirt running with zero VMs defined =="
+if [[ $(systemctl is-enabled libvirtd.service 2>/dev/null) == enabled ]]; then
+  if ! ls /etc/libvirt/qemu/*.xml >/dev/null 2>&1; then
+    find_ "libvirtd enabled, no VM definitions - daemon + virbr0 for nothing"
+    if [[ $FIX == --fix ]]; then
+      systemctl disable --now libvirtd.service libvirtd.socket libvirtd-ro.socket libvirtd-admin.socket 2>/dev/null \
+        && say "          -> disabled (re-enable when you actually create VMs)"
+    fi
+  else ok "libvirt has VMs defined"; fi
+else ok "libvirt not enabled"; fi
+
+say; say "== RGB controllers without a userspace driver =="
+if lsusb 2>/dev/null | grep -qiE 'LEDFanBox|264a:|RGB'; then
+  if command -v openrgb >/dev/null 2>&1; then ok "openrgb installed ($(timeout 15 openrgb --list-devices 2>/dev/null | grep -c '^[0-9]*: ' || echo '?') devices)"
+  else find_ "RGB hardware present, no controller software (apt install openrgb)"; fi
+else ok "no standalone RGB controllers detected"; fi
+
+say; say "== top repeated journal errors this boot =="
+journalctl -p err -b --no-pager 2>/dev/null | awk '{$1=$2=$3="";print}' | sort | uniq -c | sort -rn | head -5 | sed 's/^/  /'
+
+say; say "done. FINDINGS above are worth a look; everything labelled ok is healthy."
