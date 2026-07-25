@@ -12,6 +12,8 @@ and the thing that actually works.
 | [brave-flags](brave-flags/) | no place to put Chromium command-line flags | .desktop Exec override + the background-process relaunch trap |
 | [midscroll](midscroll/) | `xinput` can't toggle button-scrolling on Wayland | KWin owns libinput; its D-Bus InputDevice properties can |
 | [wake-kick](wake-kick/) | black screen after sleep at 240Hz (DSC link) | resume hook re-asserts the mode = forced DP retrain; logs evidence |
+| [webapp](webapp/) | self-hosted services live in browser tabs, not the taskbar | Chromium invents a WM class per URL, so a pinned icon never matches its window without an explicit `--class` |
+| [podman-gpu](podman-gpu/) | Docker Desktop guides are written for macOS; rootless GPU containers fail silently | `aardvark-dns` is only a Recommends, and podman ignores `deploy.resources` GPU syntax without erroring |
 
 The flagship is **autoscroll**: hold the middle button, the cursor moves freely,
 and the page scrolls continuously, faster the further you move from where you
