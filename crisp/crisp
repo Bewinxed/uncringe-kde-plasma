@@ -1,63 +1,96 @@
 #!/usr/bin/env bash
-# Crisp text at native scale on the Neo G9.
+# crisp - sharp text AND sharp bitmaps at native scale. No hardcoded values:
+# the panel is measured, the DPI is derived.
 #
 # WHY
-#   Display scaling (1.25) and font DPI are DIFFERENT levers and only one of them
-#   is right here. Scaling renders the UI at 96 DPI then *resamples* it: bigger,
-#   but every cached bitmap gets interpolated - that is the blurry-favicon bug
-#   (Chromium needs 20px icons at 1.25 and only has 16px cached, so it upscales).
-#   Raising font DPI instead makes Qt render glyphs at a larger pixel size
-#   NATIVELY: bigger AND sharper, nothing resampled, favicons untouched.
+#   Display scaling and font DPI are DIFFERENT levers. Scaling renders the UI at
+#   96 DPI then *resamples* it: bigger, but every cached bitmap gets interpolated
+#   - that is the blurry-favicon bug (Chromium needs 20px icons at 1.25x, has
+#   16px cached, upscales). Raising font DPI instead makes toolkits rasterise
+#   glyphs at a larger size NATIVELY: bigger AND sharper, nothing resampled.
 #
-#   Font DPI had never been set on this box (96, both force keys unset), so the
-#   correct lever was simply unused.
+# MEASUREMENT (methodology from github.com/acrion/wayland-font-dpi)
+#   true_dpi = diagonal_px / diagonal_inch, from the panel's EDID physical size.
+#   target font DPI = round(true_dpi * comfort), comfort defaulting to 1.10.
 #
-#   Subpixel AA is NOT the issue and X11 is not the fix. Measured on this machine:
-#   Chromium page text is 82-84% colour-fringed (subpixel active) while KDE panel
-#   text is 0.4% (grayscale) - same Wayland session. It is a Qt choice, not a
-#   Wayland limit. Plasma 6.8 (end of 2026) is Wayland-only anyway.
+#   Read the EDID size from `kscreen-doctor -j` (KWin's own view) - NEVER from
+#   xdpyinfo: XWayland *synthesizes* its millimetre values to force 96 DPI
+#   (mm = px/96*25.4 exactly), so it always "measures" 96 and the derivation
+#   silently becomes a no-op. That synthetic value masqueraded as a real
+#   measurement here once; kscreen reports the EDID truth.
 #
-#   For the "thin, washed-out light-on-dark" complaint the lever that actually
-#   works on TrueType fonts like Noto Sans is hintfull + FreeType interpreter
-#   version 35, which snaps stems hard to the pixel grid (the old MS/ClearType
-#   look). Stem darkening is deliberately NOT used: FreeType's TrueType driver
-#   does not implement it, so it would be a no-op here.
+# OTHER LESSONS ENCODED BELOW
+#   * Subpixel AA is NOT the issue: measured on this stack, Chromium page text
+#     is 82-84% colour-fringed (subpixel active) while KDE panel text is 0.4%
+#     (grayscale) in the same Wayland session. Qt choice, not Wayland limit.
+#   * hintfull + FreeType interpreter-version=35 is the real lever for thin
+#     light-on-dark text. Stem darkening is a no-op in FreeType's TrueType driver.
+#   * ~/.config/fontconfig/fonts.conf is parsed AFTER conf.d/, so hintstyle must
+#     be fixed at its source or a conf.d override silently loses.
+#   * GTK reads none of KDE's font settings: propagate DPI/96 via gsettings
+#     text-scaling-factor (immediate). Verified not to leak into Chromium's
+#     devicePixelRatio, so it cannot re-blur favicons.
 #
-# Usage: crisp apply | revert | status
+# Usage:
+#   crisp apply [comfort]   # measure panel, derive DPI, apply everything
+#   crisp dpi <N>           # manual DPI override (Qt + GTK together)
+#   crisp status
+#   crisp revert
 set -euo pipefail
 
-# Size parity maths: the old setup was 96 DPI x 1.25 scale = 120 DPI equivalent.
-# So 120 at scale 1.0 reproduces the previous text size while rendering natively.
-# Go higher for bigger text - it stays crisp, because glyphs are rasterised at the
-# larger size rather than upscaled.
-DPI=${CRISP_DPI:-120}
-# GTK apps read none of KDE's font settings. Methodology borrowed from
-# github.com/acrion/wayland-font-dpi: propagate the same factor to GTK via
-# gsettings text-scaling-factor (text-only, immediate effect, no relogin).
-# Their auto-DPI-from-EDID part is deliberately NOT used: this panel is a true
-# 96.0 DPI display, so their formula returns factor 1.000 - a no-op. The DPI
-# here is a comfort choice, not a physical correction.
-GTK_FACTOR=$(python3 -c "print(round($DPI/96, 4))")
-OUT=${CRISP_OUTPUT:-DP-1}
+COMFORT_DEFAULT=1.10
 FC="$HOME/.config/fontconfig/conf.d/99-crisp.conf"
 ENVD="$HOME/.config/environment.d/95-crisp.conf"
 KG="$HOME/.config/kdeglobals"
 BAK="$HOME/.config/kdeglobals.crisp-bak"
+STATE="$HOME/.config/crisp.state"
 FTPROPS="truetype:interpreter-version=35"
 
-scale_now() { kscreen-doctor -o 2>/dev/null | sed -E 's/\x1b\[[0-9;]*m//g' \
-  | grep -A20 "$OUT" | grep -oP 'Scale: \K[0-9.]+' | head -1; }
+# --- measure the primary panel via KWin's JSON API ---------------------------
+probe() {  # prints: name px_w px_h mm_w mm_h scale true_dpi
+  kscreen-doctor -j 2>/dev/null | python3 -c '
+import json, sys, math
+d = json.load(sys.stdin)
+outs = [o for o in d["outputs"] if o.get("enabled")]
+outs.sort(key=lambda o: o.get("priority") or 99)
+o = outs[0]
+mode = next((m for m in o["modes"] if m["id"] == o.get("currentModeId")), None)
+px_w, px_h = mode["size"]["width"], mode["size"]["height"]
+mm = o.get("sizeMM") or o.get("sizeMm") or {}
+mm_w, mm_h = mm.get("width") or 0, mm.get("height") or 0
+if mm_w and mm_h:
+    dpi = math.hypot(px_w, px_h) / (math.hypot(mm_w, mm_h) / 25.4)
+else:
+    dpi = 96.0   # EDID missing: fall back to the legacy baseline
+print(o["name"], px_w, px_h, mm_w, mm_h, o.get("scale") or 1, f"{dpi:.1f}")'
+}
+
+gtk_set() {
+  command -v gsettings >/dev/null 2>&1 || return 0
+  gsettings set org.gnome.desktop.interface text-scaling-factor "$1" || true
+}
+
+set_dpi() {  # Qt (kdeglobals) + GTK (gsettings), one factor
+  kwriteconfig6 --file kdeglobals --group General --key forceFontDPI "$1"
+  kwriteconfig6 --file kdeglobals --group General --key forceFontDPIWayland "$1"
+  gtk_set "$(python3 -c "print(round($1/96, 4))")"
+}
 
 case ${1:-status} in
 apply)
+  read -r OUT PXW PXH MMW MMH SCALE TRUEDPI < <(probe)
+  [[ -n ${OUT:-} ]] || { echo "error: could not probe outputs (kscreen-doctor -j)"; exit 1; }
+  COMFORT=${2:-${CRISP_COMFORT:-$COMFORT_DEFAULT}}
+  DPI=$(python3 -c "print(round($TRUEDPI * $COMFORT))")
+  echo ":: $OUT: ${PXW}x${PXH}px on ${MMW}x${MMH}mm -> true ${TRUEDPI} DPI"
+  echo ":: comfort x$COMFORT -> font DPI $DPI (GTK factor $(python3 -c "print(round($DPI/96,4))"))"
+
   [[ -f $BAK ]] || cp -a "$KG" "$BAK"
-  echo ":: font DPI -> $DPI (native glyph rendering, not resampling)"
-  kwriteconfig6 --file kdeglobals --group General --key forceFontDPI "$DPI"
-  kwriteconfig6 --file kdeglobals --group General --key forceFontDPIWayland "$DPI"
-  echo ":: hinting -> hintfull (snaps stems to the pixel grid)"
+  printf 'OUT=%s\nPREV_SCALE=%s\n' "$OUT" "$SCALE" > "$STATE"
+
+  set_dpi "$DPI"
   kwriteconfig6 --file kdeglobals --group General --key XftHintStyle hintfull
 
-  echo ":: fontconfig override -> $FC"
   mkdir -p "$(dirname "$FC")"
   cat > "$FC" <<'EOF'
 <?xml version="1.0"?>
@@ -73,9 +106,6 @@ apply)
   </match>
 </fontconfig>
 EOF
-
-  # ~/.config/fontconfig/fonts.conf is parsed AFTER conf.d/, so it overrides the
-  # file above. hintstyle has to be changed at its real source or it silently loses.
   FONTSCONF="$HOME/.config/fontconfig/fonts.conf"
   if [[ -f $FONTSCONF ]] && grep -q 'hintslight' "$FONTSCONF"; then
     [[ -f $FONTSCONF.crisp-bak ]] || cp -a "$FONTSCONF" "$FONTSCONF.crisp-bak"
@@ -83,47 +113,46 @@ EOF
     echo ":: fonts.conf hintslight -> hintfull (it outranks conf.d)"
   fi
 
-  if command -v gsettings >/dev/null 2>&1; then
-    echo ":: GTK text-scaling-factor -> $GTK_FACTOR (immediate, no relogin)"
-    gsettings set org.gnome.desktop.interface text-scaling-factor "$GTK_FACTOR" || true
-  fi
-
-  echo ":: FreeType interpreter 35 -> $ENVD"
   mkdir -p "$(dirname "$ENVD")"
   echo "FREETYPE_PROPERTIES=$FTPROPS" > "$ENVD"
   systemctl --user set-environment "FREETYPE_PROPERTIES=$FTPROPS" 2>/dev/null || true
 
-  # scale LAST: it is the only step that can disturb panel geometry
-  echo ":: display scale $(scale_now) -> 1.0  (removes all bitmap resampling)"
-  kscreen-doctor "output.$OUT.scale.1" >/dev/null 2>&1 || echo "   !! scale change failed"
-  sleep 2
-  echo ":: now scale=$(scale_now)"
+  # scale LAST - the only step that can disturb panel geometry
+  if [[ $SCALE != 1 ]]; then
+    echo ":: display scale $SCALE -> 1.0 (removes all bitmap resampling)"
+    kscreen-doctor "output.$OUT.scale.1" >/dev/null 2>&1 || echo "   !! scale change failed"
+  else
+    echo ":: display scale already 1.0"
+  fi
   echo
-  echo "Log out and back in for font DPI to reach every app."
-  echo "If the panel misbehaves: resetpanel, or relogin."
+  echo "Log out and back in for font DPI to reach every app (GTK half is live now)."
   ;;
 dpi)
-  N=${2:?usage: crisp dpi <number>   e.g. 120 parity, 132 bigger, 144 much bigger}
-  kwriteconfig6 --file kdeglobals --group General --key forceFontDPI "$N"
-  kwriteconfig6 --file kdeglobals --group General --key forceFontDPIWayland "$N"
-  command -v gsettings >/dev/null 2>&1 && \
-    gsettings set org.gnome.desktop.interface text-scaling-factor "$(python3 -c "print(round($N/96,4))")" || true
-  echo ":: font DPI -> $N (Qt + GTK)   (96=native, 120=old apparent size, 132/144=bigger)"
-  echo ":: run 'relogin' to apply - Qt reads this only at session start"
+  N=${2:?usage: crisp dpi <number>}
+  set_dpi "$N"
+  echo ":: font DPI -> $N (Qt + GTK). Re-login for Qt; GTK is immediate."
   ;;
 revert)
   [[ -f $BAK ]] && cp -a "$BAK" "$KG" && echo ":: kdeglobals restored"
   FONTSCONF="$HOME/.config/fontconfig/fonts.conf"
   [[ -f $FONTSCONF.crisp-bak ]] && cp -a "$FONTSCONF.crisp-bak" "$FONTSCONF" \
-    && echo ":: fonts.conf restored (hintslight)"
+    && echo ":: fonts.conf restored"
   rm -f "$FC" "$ENVD" && echo ":: fontconfig + env overrides removed"
-  command -v gsettings >/dev/null 2>&1 && gsettings set org.gnome.desktop.interface text-scaling-factor 1.0 || true
+  gtk_set 1.0
   systemctl --user unset-environment FREETYPE_PROPERTIES 2>/dev/null || true
-  kscreen-doctor "output.$OUT.scale.1.25" >/dev/null 2>&1 && echo ":: scale back to 1.25"
+  if [[ -f $STATE ]]; then
+    # shellcheck disable=SC1090
+    source "$STATE"
+    [[ ${PREV_SCALE:-1} != 1 ]] && kscreen-doctor "output.$OUT.scale.$PREV_SCALE" >/dev/null 2>&1 \
+      && echo ":: scale restored to $PREV_SCALE"
+    rm -f "$STATE"
+  fi
   echo "Log out and back in."
   ;;
 status)
-  echo "display scale : $(scale_now)"
+  read -r OUT PXW PXH MMW MMH SCALE TRUEDPI < <(probe) || true
+  echo "panel         : ${OUT:-?} ${PXW:-?}x${PXH:-?}px ${MMW:-?}x${MMH:-?}mm -> true ${TRUEDPI:-?} DPI"
+  echo "display scale : ${SCALE:-?}"
   for k in forceFontDPI forceFontDPIWayland XftHintStyle XftSubPixel XftAntialias; do
     printf '  %-20s %s\n' "$k" "$(kreadconfig6 --file kdeglobals --group General --key $k 2>/dev/null || echo unset)"
   done
@@ -132,5 +161,5 @@ status)
   echo "gtk text-scale: $(gsettings get org.gnome.desktop.interface text-scaling-factor 2>/dev/null || echo n/a)"
   echo "effective     : $(fc-match -v 'Noto Sans' 2>/dev/null | grep -E 'hintstyle|rgba' | tr -d ' \t' | tr '\n' ' ')"
   ;;
-*) echo "usage: crisp apply | revert | status" ;;
+*) echo "usage: crisp apply [comfort] | dpi <N> | status | revert" ;;
 esac
