@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# Middle-button scrolling for the G502, two different flavours.
+#
+# THE TWO MECHANISMS ARE MUTUALLY EXCLUSIVE
+#
+#   `midscroll on`  - libinput button scrolling (scroll method 4, on-button-down).
+#       Hold middle, MOVE the mouse, and motion becomes scroll. The cursor
+#       FREEZES while held - that is by design, your motion is being consumed as
+#       scroll input, not lost. Works in EVERY app because it happens at the
+#       input layer, below the toolkit.
+#
+#   `midscroll off` - hands the middle button back to applications, so the real
+#       Windows-style autoscroll takes over: click once, cursor anchors, page
+#       scrolls continuously at a speed set by how far you move from the anchor.
+#       Feels exactly like Windows, but ONLY works where the app implements it -
+#       here that is Brave, Claude Desktop (both via
+#       --enable-blink-features=MiddleClickAutoscroll) and Firefox
+#       (general.autoScroll). Dolphin/Kate/Okular get nothing.
+#
+#   You cannot have both: libinput consumes the middle-drag before the app sees
+#   it, so while `on`, Brave's own autoscroll can never trigger.
+#
+# NOTE: xinput set-prop does NOT work here. This is a Wayland session, so xinput
+# only reaches XWayland clients. KWin owns libinput and exposes the same
+# properties over D-Bus, which is what this script drives.
+set -euo pipefail
+
+DEV=/org/kde/KWin/InputDevice/event6      # Logitech Gaming Mouse G502
+IFACE=org.kde.KWin.InputDevice
+VID=1133; PID=49277; NAME="Logitech Gaming Mouse G502"
+
+get() { qdbus6 org.kde.KWin "$DEV" org.freedesktop.DBus.Properties.Get "$IFACE" "$1" 2>/dev/null; }
+set_() { qdbus6 org.kde.KWin "$DEV" org.freedesktop.DBus.Properties.Set "$IFACE" "$1" "$2" 2>/dev/null; }
+persist() { kwriteconfig6 --file kcminputrc --group Libinput --group $VID --group $PID \
+              --group "$NAME" --key "$1" "$2"; }
+
+# guard: the device path is index-based and can move across reboots
+[[ "$(get name)" == "$NAME" ]] || {
+  echo "error: $DEV is '$(get name)', not the G502." >&2
+  echo "Find it with: for d in /org/kde/KWin/InputDevice/event*; do echo \$d \$(qdbus6 org.kde.KWin \$d org.freedesktop.DBus.Properties.Get $IFACE name); done" >&2
+  exit 1; }
+
+case ${1:-status} in
+on)
+  set_ scrollOnButtonDown true; set_ scrollButton 274
+  persist ScrollMethod 4; persist ScrollButton 274
+  echo ":: libinput button scrolling ON (works everywhere; cursor freezes while held)"
+  ;;
+off)
+  set_ scrollOnButtonDown false
+  persist ScrollMethod 0
+  echo ":: libinput button scrolling OFF"
+  echo ":: apps now get the middle button - real Windows autoscroll in Brave/Firefox/Claude"
+  ;;
+factor)
+  N=${2:?usage: midscroll factor <number>   1 = default, 2 = twice as fast, 0.5 = slower}
+  set_ scrollFactor "$N"; persist ScrollFactor "$N"
+  echo ":: scrollFactor -> $N"
+  ;;
+status)
+  echo "device       : $(get name)"
+  echo "buttonScroll : $(get scrollOnButtonDown)   <- true = cursor freezes, works everywhere"
+  echo "scrollButton : $(get scrollButton) (274 = middle)"
+  echo "scrollFactor : $(get scrollFactor)"
+  echo "persisted    : $(grep -c 'ScrollMethod' "$HOME/.config/kcminputrc" 2>/dev/null) entry in kcminputrc"
+  ;;
+*) echo "usage: midscroll on | off | factor <n> | status" ;;
+esac
