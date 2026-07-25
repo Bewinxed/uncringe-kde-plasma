@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# perfmode - Threadripper performance on demand, "how AMD wants it".
+#
+# There is nothing to tune on a correctly configured Zen 4 box - and correctly
+# configured means: amd_pstate in ACTIVE mode (firmware autonomy), prefcore
+# enabled (best cores ranked for the scheduler), boost on, and EPP as the only
+# knob. EPP is a BIAS hint to CPPC firmware, not a lock: even EPP=performance
+# lets cores idle down (measured: 2.2-4.8 GHz floating at idle on a 7960X with
+# a 410 MHz floor). So "max performance when asked, idle when it wants" is
+# literally one EPP flip away - via power-profiles-daemon, which KDE also
+# exposes in the power widget.
+#
+# Caveat encoded: ppd can only drive ONE backend; on some boards it latches
+# onto ACPI platform_profile and amd_pstate goes uncontrolled. `perfmode status`
+# shows the CpuDriver so you can see it is actually amd_pstate.
+#
+# Usage: perfmode max | auto | eco | status
+set -euo pipefail
+
+epp_now() { cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference 2>/dev/null; }
+
+case ${1:-status} in
+max)  powerprofilesctl set performance; sleep 0.5
+      echo ":: profile=performance  epp=$(epp_now)  (bias, not lock - still idles)" ;;
+auto) powerprofilesctl set balanced; sleep 0.5
+      echo ":: profile=balanced  epp=$(epp_now)  (AMD's recommended default)" ;;
+eco)  powerprofilesctl set power-saver; sleep 0.5
+      echo ":: profile=power-saver  epp=$(epp_now)" ;;
+status)
+  echo "profile : $(powerprofilesctl get 2>/dev/null || echo 'ppd not running')"
+  echo "cpudrv  : $(powerprofilesctl 2>/dev/null | grep -m1 CpuDriver | awk '{print $2}') (must be amd_pstate, not platform_profile)"
+  echo "epp     : $(epp_now)"
+  echo "pstate  : $(cat /sys/devices/system/cpu/amd_pstate/status 2>/dev/null)  prefcore=$(cat /sys/devices/system/cpu/amd_pstate/prefcore 2>/dev/null)  boost=$(cat /sys/devices/system/cpu/cpufreq/policy0/boost 2>/dev/null)"
+  python3 - <<'PY'
+import glob
+fs = [int(open(f).read()) for f in glob.glob('/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq')]
+lo = int(open('/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq').read())
+hi = int(open('/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq').read())
+print(f"clocks  : avg {sum(fs)/len(fs)/1e6:.2f} GHz (range {min(fs)/1e6:.2f}-{max(fs)/1e6:.2f}, hw {lo/1e6:.2f}-{hi/1e6:.2f})")
+PY
+  ;;
+*) echo "usage: perfmode max | auto | eco | status" ;;
+esac
