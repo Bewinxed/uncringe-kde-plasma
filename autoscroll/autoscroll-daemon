@@ -60,9 +60,10 @@ DEADZONE   = 8       # px of slack before scrolling starts
 RANGE      = 250.0   # px of travel from deadzone to full speed
 MAX_RATE   = 1.2     # notches per frame at full deflection (~72/sec)
 CURVE      = 1.4     # 1 = linear, higher = finer control near the anchor
-SMOOTH     = 0.12    # s, easing time-constant: scroll speed glides toward its
-                     # target instead of stepping (the macOS-feel half that fits a
-                     # hold gesture; momentum/flick does not). 0 = raw/instant.
+SMOOTH     = 0.12    # s, easing time-constant for slowing down / stopping
+SMOOTH_UP  = 0.05    # s, easing when speeding up - shorter so acceleration feels
+                     # responsive while the stop stays soft (asymmetric attack/
+                     # release, same trick audio compressors use). 0 = raw.
 FRAME      = 0.016   # ~60 Hz
 CLICK_SLOP = 6       # px still counted as "a click, not a drag"
 CLICK_TIME = 0.35    # s; longer is a drag even without motion
@@ -129,7 +130,8 @@ class Mouse:
 async def run(args):
     grab = not args.safe
     tune = dict(deadzone=args.deadzone, range=args.range,
-                max_rate=args.max_rate, curve=args.curve, smooth=args.smooth)
+                max_rate=args.max_rate, curve=args.curve, smooth=args.smooth,
+                smooth_up=args.smooth_up)
     debug, freeze = args.debug, args.freeze
 
     wheel = evdev.UInput({e.EV_REL: [e.REL_WHEEL, e.REL_WHEEL_HI_RES]},
@@ -243,7 +245,11 @@ async def run(args):
                 # instead of stepping. alpha derives from the time-constant, so the
                 # feel is framerate-independent.
                 if tune["smooth"] > 0:
-                    alpha = 1.0 - math.exp(-FRAME / tune["smooth"])
+                    # attack when gaining speed or flipping direction, release
+                    # when easing off - acceleration snappy, stop buttery
+                    speeding = abs(target) > abs(st["srate"]) or target * st["srate"] < 0
+                    tau = tune["smooth_up"] if speeding else tune["smooth"]
+                    alpha = 1.0 - math.exp(-FRAME / tau) if tau > 0 else 1.0
                     st["srate"] += alpha * (target - st["srate"])
                     if target == 0.0 and abs(st["srate"]) < 0.002:
                         st["srate"] = 0.0           # snap the tail to silence
@@ -351,7 +357,9 @@ def main():
     ap.add_argument("--max-rate", type=float, default=MAX_RATE)
     ap.add_argument("--curve", type=float, default=CURVE)
     ap.add_argument("--smooth", type=float, default=SMOOTH,
-                    help="easing time-constant in seconds (0 = raw, no easing)")
+                    help="easing time-constant for slowing/stopping (0 = raw)")
+    ap.add_argument("--smooth-up", type=float, default=SMOOTH_UP,
+                    help="easing time-constant for speeding up (smaller = snappier)")
     a = ap.parse_args()
 
     if a.list:
