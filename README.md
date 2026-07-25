@@ -7,8 +7,8 @@ and the thing that actually works.
 | Module | Papercut | The non-obvious part |
 |---|---|---|
 | [autoscroll](autoscroll/) | no Windows middle-click autoscroll anywhere | libinput's "button scrolling" is a different feature; needs an evdev daemon + native-app passthrough |
-| [crisp](crisp/) | blurry text at 100%, blurry bitmaps at 125% | font DPI and display scaling are different levers; only one resamples your favicons |
-| [qatar-locale](qatar-locale/) | Arabic-Indic digits everywhere with `ar_QA` | Qt ignores glibc digits AND `@numbers=latn`; per-category `LC_*` is the only path |
+| [crisp](crisp/) | blurry text at 100%, blurry bitmaps at 125% | font DPI ≠ display scaling; DPI auto-derived from EDID (and xdpyinfo lies about mm) |
+| [latin-locale](latin-locale/) | native digits everywhere with `ar_*`/`hi_IN`/... | Qt ignores glibc digits AND `@numbers=latn`; per-category `LC_*` is the only path |
 | [brave-flags](brave-flags/) | no place to put Chromium command-line flags | .desktop Exec override + the background-process relaunch trap |
 | [midscroll](midscroll/) | `xinput` can't toggle button-scrolling on Wayland | KWin owns libinput; its D-Bus InputDevice properties can |
 
