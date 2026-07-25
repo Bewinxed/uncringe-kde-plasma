@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Owns Brave's command-line flags via a .desktop override.
+#
+# Brave's launcher (/usr/bin/brave-browser) does NOT read a *-flags.conf the way
+# Arch's chromium wrapper does, and chrome://flags cannot express these, so the
+# only persistent home for them is an Exec= override in
+# ~/.local/share/applications/brave-browser.desktop.
+#
+# Edit FLAGS below, run `brave-flags apply`, then fully quit and relaunch Brave
+# (from the menu - a restored session does not re-read the .desktop file).
+set -euo pipefail
+
+FLAGS=(
+  # Middle-click drag-to-scroll, like Windows. Chromium ships this ON for
+  # Windows and OFF for Linux, where middle-click is traditionally
+  # paste-primary-selection. Not exposed in chrome://flags - command line only.
+  # Tradeoff: middle-click no longer pastes the primary selection inside Brave.
+  --enable-blink-features=MiddleClickAutoscroll
+)
+# Deliberately NOT included: --disable-features=WaylandPerSurfaceScale. It was a
+# workaround for fractional-scale blur and measured only ~11% sharper on the tab
+# strip (zero on the bookmark bar). At display scale 1.0 there is no fractional
+# scaling left to work around, so it is dead weight. See `crisp`.
+
+SYSTEM=/usr/share/applications/brave-browser.desktop
+OVERRIDE="$HOME/.local/share/applications/brave-browser.desktop"
+
+case ${1:-list} in
+apply)
+  F="${FLAGS[*]}"
+  # Insert before any %U/%F field code, on every Exec= line (main/new-window/incognito).
+  sed -E "s|^Exec=(/usr/bin/brave-browser-stable)(.*)$|Exec=\1 $F\2|" "$SYSTEM" > "$OVERRIDE"
+  update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
+  echo ":: wrote $OVERRIDE"
+  grep -n '^Exec=' "$OVERRIDE" | sed 's/^/   /'
+  echo ":: fully quit Brave and relaunch from the menu"
+  ;;
+revert)
+  rm -f "$OVERRIDE"
+  update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
+  echo ":: override removed, back to packaged defaults"
+  ;;
+list)
+  echo "configured flags:"; printf '  %s\n' "${FLAGS[@]}"
+  echo
+  if [[ -f $OVERRIDE ]]; then echo "override: ACTIVE"; grep -m1 '^Exec=' "$OVERRIDE" | sed 's/^/  /'
+  else echo "override: none"; fi
+  echo
+  echo "live in the running browser:"
+  ps -o args= -C brave 2>/dev/null | grep -oE '\-\-enable-blink-features=[A-Za-z,]*' | sort -u | sed 's/^/  /' \
+    || echo "  (flag not present - needs a full restart)"
+  ;;
+*) echo "usage: brave-flags apply | revert | list" ;;
+esac
