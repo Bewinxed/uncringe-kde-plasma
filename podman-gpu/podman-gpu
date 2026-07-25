@@ -1,0 +1,306 @@
+#!/usr/bin/env bash
+# Rootless Podman + Compose + NVIDIA GPU, set up the way that actually works,
+# plus a doctor for the failures that give you no useful error message.
+#
+# The short version of why this exists: on Linux, Docker Desktop / OrbStack /
+# Dory exist to fake a Linux kernel on macOS or Windows. You already have one.
+# What you actually want is podman without a root daemon, `docker compose`
+# pointed at it, and GPUs wired through CDI. Each of those has exactly one
+# non-obvious step, and none of them fail loudly.
+set -euo pipefail
+
+UID_NUM=$(id -u)
+SOCK="/run/user/$UID_NUM/podman/podman.sock"
+CUDA_TEST_IMAGE=${CUDA_TEST_IMAGE:-docker.io/nvidia/cuda:12.6.2-base-ubuntu24.04}
+
+say()  { printf '\n\033[1;36m:: %s\033[0m\n' "$*"; }
+ok()   { printf '   \033[32m ok \033[0m %s\n' "$*"; }
+warn() { printf '   \033[33mwarn\033[0m %s\n' "$*"; }
+bad()  { printf '   \033[31mFAIL\033[0m %s\n' "$*"; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# The binary is not on PATH on Debian/Ubuntu -- podman execs it by absolute
+# path -- so `command -v aardvark-dns` alone reports a false negative.
+has_aardvark() {
+  have aardvark-dns \
+    || [[ -x /usr/lib/podman/aardvark-dns ]] \
+    || [[ -x /usr/libexec/podman/aardvark-dns ]]
+}
+need_root_helper() { [[ $EUID -eq 0 ]] && SUDO="" || SUDO="sudo"; }
+
+detect_pm() {
+  if have apt-get; then echo apt
+  elif have dnf; then echo dnf
+  else echo unknown; fi
+}
+
+# ---------------------------------------------------------------- install
+
+install_packages() {
+  local pm; pm=$(detect_pm)
+  case $pm in
+  apt)
+    # aardvark-dns is the one that bites. On Debian/Ubuntu it is only a
+    # *Recommends* of podman, so any install using --no-install-recommends
+    # silently ships a podman with no container-name DNS. Services then fail
+    # with `getaddrinfo EAI_AGAIN <name>` and nothing anywhere says "install
+    # aardvark-dns". It is listed first here on purpose.
+    $SUDO apt-get update -qq
+    $SUDO apt-get install -y \
+      aardvark-dns netavark \
+      podman podman-docker docker-compose-v2 distrobox \
+      uidmap slirp4netns passt fuse-overlayfs \
+      ca-certificates curl gnupg2
+    ;;
+  dnf)
+    $SUDO dnf install -y aardvark-dns netavark podman podman-docker \
+      docker-compose distrobox fuse-overlayfs shadow-utils passt slirp4netns
+    ;;
+  *) die_pm ;;
+  esac
+}
+
+die_pm() { echo "unsupported package manager (need apt or dnf)" >&2; exit 1; }
+
+install_nvidia() {
+  if ! have nvidia-smi; then
+    warn "no nvidia-smi -- skipping GPU support (CPU containers will still work)"
+    return
+  fi
+  if have nvidia-ctk; then ok "nvidia-container-toolkit already installed"; return; fi
+
+  local pm; pm=$(detect_pm)
+  case $pm in
+  apt)
+    # NVIDIA's repo is distro-agnostic now (stable/deb/$arch), so it installs
+    # on releases that are not in their tested matrix.
+    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+      | $SUDO gpg --yes --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+    curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+      | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+      | $SUDO tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null
+    $SUDO apt-get update -qq
+    # Unpinned on purpose. NVIDIA's docs pin an exact version, which just
+    # strands you on a stale toolkit -- and <1.19 lacks the auto-refresh units.
+    $SUDO apt-get install -y nvidia-container-toolkit
+    ;;
+  dnf)
+    curl -fsSL -o /tmp/nvidia-container-toolkit.repo \
+      https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo
+    $SUDO mv /tmp/nvidia-container-toolkit.repo /etc/yum.repos.d/
+    $SUDO dnf install -y nvidia-container-toolkit
+    ;;
+  *) die_pm ;;
+  esac
+
+  # Deliberately NOT setting nvidia-container-cli.no-cgroups. Every rootless
+  # GPU guide on the internet tells you to. It belongs to the *legacy* runtime
+  # hook; with CDI, podman injects the devices itself and /dev/nvidia* are
+  # already 0666, so rootless works untouched. Setting it is a system-wide
+  # change that breaks *rootful* GPU containers in exchange for nothing.
+  # Verified by running a real container both ways.
+
+  if systemctl list-unit-files nvidia-cdi-refresh.path >/dev/null 2>&1; then
+    # Toolkit >=1.19 ships .path + .service that watch modules.dep and
+    # regenerate /var/run/cdi/nvidia.yaml on any driver change. That covers
+    # package upgrades AND a hand-built driver, since `make modules_install`
+    # rewrites modules.dep. Do not hand-roll a unit of this name.
+    $SUDO systemctl enable --now nvidia-cdi-refresh.path
+    ok "CDI auto-refresh active (survives driver upgrades)"
+  else
+    $SUDO mkdir -p /var/run/cdi
+    $SUDO nvidia-ctk cdi generate --output=/var/run/cdi/nvidia.yaml
+    warn "toolkit <1.19: no auto-refresh units. Re-run 'podman-gpu refresh' after driver updates."
+  fi
+}
+
+wire_compose() {
+  systemctl --user enable --now podman.socket
+  local rc line="export DOCKER_HOST=\"unix://$SOCK\""
+  for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+    [[ -f $rc ]] || continue
+    grep -q 'DOCKER_HOST.*podman.sock' "$rc" && continue
+    printf '\n# docker compose / Testcontainers -> rootless podman\n%s\n' "$line" >> "$rc"
+    ok "DOCKER_HOST added to $(basename "$rc")"
+  done
+}
+
+cmd_install() {
+  need_root_helper
+  say "packages"           ; install_packages
+  say "nvidia gpu"         ; install_nvidia
+  say "compose + socket"   ; wire_compose
+  say "verify"             ; cmd_check || true
+  echo
+  echo ":: open a new shell so DOCKER_HOST is set, then: podman-gpu doctor <compose.yml>"
+}
+
+# ---------------------------------------------------------------- check
+
+cmd_check() {
+  local fail=0
+  have podman && ok "podman $(podman --version | awk '{print $3}')" || { bad "podman missing"; fail=1; }
+
+  if has_aardvark; then
+    ok "aardvark-dns present (container-name DNS works)"
+  else
+    bad "aardvark-dns MISSING -- containers cannot resolve each other by name"; fail=1
+  fi
+
+  if have docker; then ok "docker shim -> $(docker --version 2>&1 | head -1)"
+  else warn "no 'docker' command (install podman-docker) -- 'podman compose' still works"; fi
+
+  if docker compose version >/dev/null 2>&1 || podman compose version >/dev/null 2>&1; then
+    ok "compose available"
+  else bad "no compose provider"; fail=1; fi
+
+  systemctl --user is-active --quiet podman.socket \
+    && ok "rootless podman.socket active" || warn "podman.socket inactive (compose may not connect)"
+
+  if have nvidia-smi; then
+    local devs; devs=$(nvidia-ctk cdi list 2>/dev/null | grep -c 'nvidia.com/gpu' || true)
+    if [[ ${devs:-0} -gt 0 ]]; then ok "CDI exposes $devs nvidia device names"
+    else bad "no CDI devices -- run 'podman-gpu refresh'"; fail=1; fi
+
+    say "smoke test: real GPU container"
+    if podman run --rm --device nvidia.com/gpu=all "$CUDA_TEST_IMAGE" \
+         nvidia-smi --query-gpu=index,name --format=csv,noheader 2>/dev/null; then
+      ok "rootless GPU container works"
+    else
+      bad "GPU container failed"; fail=1
+    fi
+  fi
+  return $fail
+}
+
+cmd_refresh() {
+  need_root_helper
+  if systemctl list-unit-files nvidia-cdi-refresh.service >/dev/null 2>&1; then
+    $SUDO systemctl start nvidia-cdi-refresh.service
+  else
+    $SUDO mkdir -p /var/run/cdi
+    $SUDO nvidia-ctk cdi generate --output=/var/run/cdi/nvidia.yaml
+  fi
+  nvidia-ctk cdi list | sed 's/^/   /'
+}
+
+# ---------------------------------------------------------------- doctor
+
+# Heuristic, grep-based scan. It is deliberately not a YAML parser: the point is
+# to catch the handful of things that fail *silently*, not to validate compose.
+cmd_doctor() {
+  local file=${1:-}
+  say "host"
+  if has_aardvark; then ok "container DNS available"
+  else bad "aardvark-dns missing -> 'getaddrinfo EAI_AGAIN <service>' at runtime"; fi
+
+  # Two CDI specs with the same device names is a hard error, not a merge.
+  if [[ -f /etc/cdi/nvidia.yaml && -f /var/run/cdi/nvidia.yaml ]]; then
+    bad "CDI spec in BOTH /etc/cdi and /var/run/cdi -- duplicate device names will error. Delete /etc/cdi/nvidia.yaml."
+  fi
+
+  if grep -qsE '^\s*no-cgroups\s*=\s*true' /etc/nvidia-container-runtime/config.toml; then
+    warn "no-cgroups=true is set -- unnecessary with CDI, and it breaks ROOTFUL GPU containers"
+  fi
+
+  [[ -n $file ]] || { echo; echo "   (pass a compose file to scan it: podman-gpu doctor docker-compose.yml)"; return 0; }
+  [[ -f $file ]] || { bad "no such file: $file"; return 1; }
+
+  say "compose: $file"
+
+  if grep -qE 'reservations:' "$file" && grep -qE 'driver:\s*nvidia' "$file"; then
+    bad "uses deploy.resources.reservations.devices for GPU."
+    echo "        podman IGNORES it silently: the container starts with no GPU and no error."
+    echo "        replace with:  devices: [\"nvidia.com/gpu=all\"]"
+  fi
+
+  # Every check below is an if/fi, not `grep && warn`. Under `set -e` a bare
+  # `cmd && action` whose cmd does not match returns non-zero and kills the
+  # script -- which silently truncates the whole report at the first clean
+  # check. Learned the hard way.
+  local lowports
+  lowports=$(grep -oE '^\s*-\s*"?[0-9]{1,4}:' "$file" | grep -oE '[0-9]+' | awk '$1<1024' | sort -u | tr '\n' ' ' || true)
+  if [[ -n ${lowports// /} ]]; then
+    warn "privileged ports ($lowports) -- rootless cannot bind <1024 without sysctl or a rootful stack"
+  fi
+  if grep -qE '^\s*privileged:\s*true' "$file"; then
+    warn "privileged: true does nothing real under rootless (capabilities are namespaced)"
+  fi
+  if grep -qE '^\s*network_mode:\s*"?host' "$file"; then
+    warn "network_mode: host under rootless shares your netns but grants no host NET_ADMIN"
+  fi
+  if grep -qE '/run/dbus' "$file"; then
+    warn "/run/dbus mounted -- BlueZ and most system-bus work needs real root, i.e. a rootful stack"
+  fi
+
+  # The expensive one to diagnose by hand: bind-mount data owned by uids that
+  # rootless cannot map. Common when a stack was created under rootful Docker.
+  say "bind-mount ownership vs rootless uid mapping"
+  local dir base foreign=0
+  base=$(cd "$(dirname "$file")" && pwd)
+  while read -r dir; do
+    dir=${dir#./}; [[ -z $dir ]] && continue
+    local path="$base/$dir"; [[ -e $path ]] || continue
+    local owners; owners=$(find "$path" -maxdepth 2 -printf '%U\n' 2>/dev/null | sort -un | tr '\n' ' ')
+    for o in $owners; do
+      [[ $o == "$UID_NUM" ]] && continue
+      foreign=1
+      printf '   \033[31mFAIL\033[0m %s has files owned by uid %s\n' "$dir" "$o"
+    done
+  done < <(grep -oE '^\s*-\s+\./[^:]+:' "$file" | sed -E 's/^\s*-\s+//; s/:$//' | sort -u)
+
+  if ((foreign)); then
+    cat <<'EOF'
+
+   Rootless podman maps container root to YOUR uid, so it cannot write files
+   owned by uid 0 (or any other id). This is the usual cause of:
+       PermissionError: '/config/.HA_VERSION'
+       sqlite3.OperationalError: attempt to write a readonly database
+   It bites hardest on data created by a previous ROOTFUL Docker install, and on
+   filesystems that persist real ownership -- note that NTFS mounted with `acl`
+   DOES store uids, so `uid=` in fstab is only a fallback, not an override.
+
+   Two ways out:
+     1. Run this stack rootful:  sudo DOCKER_HOST=unix:///run/podman/podman.sock docker compose up -d
+        (correct when the stack wants privileged / host networking / dbus anyway)
+     2. Re-own it for rootless:  podman unshare chown -R 0:0 <dirs>
+   Rootful and rootless keep SEPARATE image, volume and network stores -- an
+   external network created in one does not exist in the other.
+EOF
+  else
+    ok "all bind-mount data is owned by you -- rootless can write it"
+  fi
+}
+
+# ---------------------------------------------------------------- box
+
+cmd_box() {
+  local name=${1:?usage: podman-gpu box <name> [image]}
+  local image=${2:-docker.io/nvidia/cuda:12.6.2-cudnn-devel-ubuntu24.04}
+  local home="$HOME/.distrobox/$name"
+  have distrobox || { echo "distrobox not installed" >&2; exit 1; }
+  mkdir -p "$home"
+
+  # --nvidia, not CDI. distrobox re-binds the host driver stack at every
+  # container start, so these boxes survive a driver upgrade with no CDI
+  # regeneration. Do not combine the two on one container: you get the driver
+  # libraries twice on the search path.
+  #
+  # --home matters more than it looks. distrobox shares $HOME by default, so a
+  # container's `pip install --user` writes your real ~/.local and collides with
+  # the host and with every other box on a different CUDA version.
+  distrobox create --name "$name" --image "$image" --home "$home" --nvidia --yes
+  echo
+  echo ":: enter:  distrobox enter $name"
+  echo ":: drop:   distrobox rm -f $name && rm -rf $home"
+}
+
+case ${1:-check} in
+  install) shift; cmd_install "$@" ;;
+  check)   shift; cmd_check "$@" ;;
+  doctor)  shift; cmd_doctor "$@" ;;
+  refresh) shift; cmd_refresh "$@" ;;
+  box)     shift; cmd_box "$@" ;;
+  *) echo "usage: podman-gpu install | check | doctor [compose.yml] | refresh | box <name> [image]" ;;
+esac
