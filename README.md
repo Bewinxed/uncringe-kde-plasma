@@ -79,8 +79,8 @@ it if you flag more Electron apps.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--deadzone` | 8 | px of slack before scrolling starts |
-| `--range` | 250 | px from deadzone to full speed |
-| `--max-rate` | 1.2 | notches/frame at full deflection (~72/s) |
+| `--range` | 600 | px from deadzone to full speed |
+| `--max-rate` | 4.0 | notches/frame at full deflection (~240/s) |
 | `--curve` | 1.4 | 1 = linear; higher = finer control near the anchor |
 | `--smooth` | 0.12 | easing when slowing/stopping (s). 0 = raw |
 | `--smooth-up` | 0.05 | easing when speeding up - smaller = snappier acceleration |

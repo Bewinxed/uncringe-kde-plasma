@@ -57,8 +57,8 @@ STATE_FILE = os.path.join(
 #     norm = clamp((|off| - DEADZONE) / RANGE, 0..1)
 #     notches_per_frame = MAX_RATE * norm ** CURVE
 DEADZONE   = 8       # px of slack before scrolling starts
-RANGE      = 250.0   # px of travel from deadzone to full speed
-MAX_RATE   = 1.2     # notches per frame at full deflection (~72/sec)
+RANGE      = 600.0   # px of travel from deadzone to full speed
+MAX_RATE   = 4.0     # notches per frame at full deflection (~240/sec)
 CURVE      = 1.4     # 1 = linear, higher = finer control near the anchor
 SMOOTH     = 0.12    # s, easing time-constant for slowing down / stopping
 SMOOTH_UP  = 0.05    # s, easing when speeding up - shorter so acceleration feels
