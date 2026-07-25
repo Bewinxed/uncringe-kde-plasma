@@ -1,11 +1,20 @@
 # uncringe-kde-plasma
 
 Fixes for the papercuts that make KDE Plasma feel cringe to a Windows refugee.
+Each module is one annoyance, the dead ends that looked like fixes but aren't,
+and the thing that actually works.
 
-First module: **Windows-style middle-click autoscroll** — the one where you hold
-the middle button, the cursor moves freely, and the page scrolls continuously,
-faster the further you move from where you pressed. System-wide, any mouse, on
-Wayland.
+| Module | Papercut | The non-obvious part |
+|---|---|---|
+| [autoscroll](autoscroll/) | no Windows middle-click autoscroll anywhere | libinput's "button scrolling" is a different feature; needs an evdev daemon + native-app passthrough |
+| [crisp](crisp/) | blurry text at 100%, blurry bitmaps at 125% | font DPI and display scaling are different levers; only one resamples your favicons |
+| [qatar-locale](qatar-locale/) | Arabic-Indic digits everywhere with `ar_QA` | Qt ignores glibc digits AND `@numbers=latn`; per-category `LC_*` is the only path |
+| [brave-flags](brave-flags/) | no place to put Chromium command-line flags | .desktop Exec override + the background-process relaunch trap |
+| [midscroll](midscroll/) | `xinput` can't toggle button-scrolling on Wayland | KWin owns libinput; its D-Bus InputDevice properties can |
+
+The flagship is **autoscroll**: hold the middle button, the cursor moves freely,
+and the page scrolls continuously, faster the further you move from where you
+pressed. System-wide, any mouse, on Wayland.
 
 ## Why this exists
 
