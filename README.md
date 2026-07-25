@@ -82,6 +82,7 @@ it if you flag more Electron apps.
 | `--range` | 250 | px from deadzone to full speed |
 | `--max-rate` | 1.2 | notches/frame at full deflection (~72/s) |
 | `--curve` | 1.4 | 1 = linear; higher = finer control near the anchor |
+| `--smooth` | 0.12 | easing time-constant (s): speed glides toward its target instead of stepping. 0 = raw |
 | `--freeze` | off | pin the cursor during gestures (prevents wheel landing on other widgets, feels bad) |
 | `--safe` | off | never grab; inject wheel only. Cannot affect input, but clicks aren't suppressed |
 | `--seconds N` | 0 | auto-release after N seconds — use while experimenting |

@@ -43,7 +43,7 @@ MODES
     --safe    no grabs, wheel injection only. Cannot affect input, but the middle
               click is not suppressed (paste / open-in-new-tab fire alongside).
 """
-import argparse, asyncio, os, signal, subprocess, sys, threading, time
+import argparse, asyncio, math, os, signal, subprocess, sys, threading, time
 import evdev
 from evdev import ecodes as e
 
@@ -60,6 +60,9 @@ DEADZONE   = 8       # px of slack before scrolling starts
 RANGE      = 250.0   # px of travel from deadzone to full speed
 MAX_RATE   = 1.2     # notches per frame at full deflection (~72/sec)
 CURVE      = 1.4     # 1 = linear, higher = finer control near the anchor
+SMOOTH     = 0.12    # s, easing time-constant: scroll speed glides toward its
+                     # target instead of stepping (the macOS-feel half that fits a
+                     # hold gesture; momentum/flick does not). 0 = raw/instant.
 FRAME      = 0.016   # ~60 Hz
 CLICK_SLOP = 6       # px still counted as "a click, not a drag"
 CLICK_TIME = 0.35    # s; longer is a drag even without motion
@@ -107,7 +110,7 @@ class Mouse:
         self.grabbed = False
         self.task = None
         self.st = {"held": False, "native": False, "off": 0, "travel": 0,
-                   "t0": 0.0, "accum": 0.0, "hires": 0.0}
+                   "t0": 0.0, "accum": 0.0, "hires": 0.0, "srate": 0.0}
 
     def release(self):
         if self.task:
@@ -126,7 +129,7 @@ class Mouse:
 async def run(args):
     grab = not args.safe
     tune = dict(deadzone=args.deadzone, range=args.range,
-                max_rate=args.max_rate, curve=args.curve)
+                max_rate=args.max_rate, curve=args.curve, smooth=args.smooth)
     debug, freeze = args.debug, args.freeze
 
     wheel = evdev.UInput({e.EV_REL: [e.REL_WHEEL, e.REL_WHEEL_HI_RES]},
@@ -185,7 +188,7 @@ async def run(args):
                     else:
                         if debug: print(f"[mid] press ({cls}) -> gesture", flush=True)
                         st.update(held=True, off=0, travel=0, t0=time.monotonic(),
-                                  accum=0.0, hires=0.0)
+                                  accum=0.0, hires=0.0, srate=0.0)
                         if grab:
                             continue          # swallow; replayed on release if a click
                 elif ev.value == 0:
@@ -228,12 +231,27 @@ async def run(args):
                     if debug:
                         print(f"[resync] {m.dev.name}: stale held flag cleared", flush=True)
                     continue
+                # target rate from displacement (0 inside the deadzone)
+                target = 0.0
                 mag = abs(st["off"]) - tune["deadzone"]
-                if mag <= 0:
+                if mag > 0:
+                    norm = min(mag / tune["range"], 1.0)
+                    target = tune["max_rate"] * (norm ** tune["curve"])
+                    if st["off"] > 0:               # below anchor = scroll down
+                        target = -target
+                # easing: first-order low-pass toward the target, so speed glides
+                # instead of stepping. alpha derives from the time-constant, so the
+                # feel is framerate-independent.
+                if tune["smooth"] > 0:
+                    alpha = 1.0 - math.exp(-FRAME / tune["smooth"])
+                    st["srate"] += alpha * (target - st["srate"])
+                    if target == 0.0 and abs(st["srate"]) < 0.002:
+                        st["srate"] = 0.0           # snap the tail to silence
+                else:
+                    st["srate"] = target
+                signed = st["srate"]
+                if signed == 0.0:
                     continue
-                norm = min(mag / tune["range"], 1.0)
-                rate = tune["max_rate"] * (norm ** tune["curve"])
-                signed = -rate if st["off"] > 0 else rate   # below anchor = scroll down
                 st["hires"] += signed * 120.0
                 st["accum"] += signed
                 hi, notches = int(st["hires"]), int(st["accum"])
@@ -332,6 +350,8 @@ def main():
     ap.add_argument("--range", type=float, default=RANGE)
     ap.add_argument("--max-rate", type=float, default=MAX_RATE)
     ap.add_argument("--curve", type=float, default=CURVE)
+    ap.add_argument("--smooth", type=float, default=SMOOTH,
+                    help="easing time-constant in seconds (0 = raw, no easing)")
     a = ap.parse_args()
 
     if a.list:
