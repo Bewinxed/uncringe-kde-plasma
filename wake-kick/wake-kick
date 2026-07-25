@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# /usr/lib/systemd/system-sleep/wake-kick
+# Re-assert the display pipeline after resume.
+#
+# WHY: high-bandwidth DP links (e.g. a Samsung G9 at 5120x1440@240 = DSC
+# compressed) sometimes fail link retraining after display sleep on
+# NVIDIA -> black screen until the cable is replugged. This is the failure
+# mode left over AFTER the canonical fixes (NVreg_PreserveVideoMemoryAllocations=1
+# + nvidia-suspend/resume/hibernate services) are in place - check those first.
+#
+# WHAT: on resume, force DPMS on and re-set the current mode. On a healthy
+# wake both are no-ops; on a stuck link the explicit modeset forces a retrain.
+# Everything is derived at runtime: the seat-0 graphical user from loginctl,
+# the output and mode from kscreen-doctor's JSON. Logs to the journal as
+# 'wake-kick' so failed wakes finally leave evidence.
+#
+# system-sleep scripts BLOCK resume until they exit, so the work is backgrounded.
+case ${1:-} in
+post)
+  (
+    sleep 3
+    # find the active graphical session on seat0
+    read -r SID SUID USER_NAME _ < <(loginctl list-sessions --no-legend | awk '$4=="seat0"{print $1,$2,$3; exit}')
+    [[ -n ${USER_NAME:-} ]] || { echo "no seat0 session found"; exit 0; }
+    RUN="runuser -u $USER_NAME -- env XDG_RUNTIME_DIR=/run/user/$SUID WAYLAND_DISPLAY=wayland-0"
+    echo "resume: kicking display for $USER_NAME (session $SID)"
+    $RUN kscreen-doctor --dpms on 2>&1 || true
+    # re-assert current mode on every enabled output (explicit modeset = retrain)
+    $RUN kscreen-doctor -j 2>/dev/null | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+for o in d["outputs"]:
+    if o.get("enabled") and o.get("currentModeId") is not None:
+        print("output.%s.mode.%s" % (o["name"], o["currentModeId"]))' | while read -r arg; do
+      echo "re-assert: $arg"
+      $RUN kscreen-doctor "$arg" 2>&1 || true
+    done
+    echo "resume kick done"
+  ) 2>&1 | systemd-cat -t wake-kick &
+  ;;
+esac
+exit 0

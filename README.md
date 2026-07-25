@@ -11,6 +11,7 @@ and the thing that actually works.
 | [latin-locale](latin-locale/) | native digits everywhere with `ar_*`/`hi_IN`/... | Qt ignores glibc digits AND `@numbers=latn`; per-category `LC_*` is the only path |
 | [brave-flags](brave-flags/) | no place to put Chromium command-line flags | .desktop Exec override + the background-process relaunch trap |
 | [midscroll](midscroll/) | `xinput` can't toggle button-scrolling on Wayland | KWin owns libinput; its D-Bus InputDevice properties can |
+| [wake-kick](wake-kick/) | black screen after sleep at 240Hz (DSC link) | resume hook re-asserts the mode = forced DP retrain; logs evidence |
 
 The flagship is **autoscroll**: hold the middle button, the cursor moves freely,
 and the page scrolls continuously, faster the further you move from where you
