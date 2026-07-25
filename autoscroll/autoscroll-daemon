@@ -132,6 +132,8 @@ async def run(args):
     wheel = evdev.UInput({e.EV_REL: [e.REL_WHEEL, e.REL_WHEEL_HI_RES]},
                          name="autoscroll-wheel")
     mice = {}                     # path -> Mouse
+    own = {wheel.device.path}     # our uinput nodes - never to be reopened
+    rejected = set()              # examined once, not a mouse - never reopened
     hb = {"t": time.monotonic()}
     stop = asyncio.Event()
 
@@ -245,32 +247,46 @@ async def run(args):
                     wheel.syn()
 
     async def adopt(path):
+        """Examine a path once. True = now managed, False = not a mouse."""
         try:
             dev = evdev.InputDevice(path)
         except OSError:
-            return
+            return False
         if not is_mouse(dev):
-            dev.close(); return
+            dev.close(); return False
         if args.name and args.name.lower() not in dev.name.lower():
-            dev.close(); return
+            dev.close(); return False
         m = Mouse(dev, grab)
+        if m.clone:
+            own.add(m.clone.device.path)
         if grab:
             await settle()
             dev.grab(); m.grabbed = True
         m.task = asyncio.create_task(guard(pump(m), f"pump:{dev.name}"))
         mice[path] = m
         print(f":: managing {dev.name} ({path}){' [grabbed]' if grab else ''}", flush=True)
+        return True
 
     async def rescan():
-        """Hotplug: adopt new mice, drop vanished ones."""
+        """Hotplug: adopt new mice, drop vanished ones.
+
+        FREEZE LESSON: every path is examined ONCE, ever. An earlier version
+        reopened all unmanaged nodes each cycle - including our own live uinput
+        nodes, which the compositor was actively reading - and that caused
+        periodic whole-screen freezes on KWin/NVIDIA. Only paths never seen
+        before (i.e. genuine hotplug) are ever opened.
+        """
         while not stop.is_set():
             present = set(evdev.list_devices())
             for path in list(mice):
                 if path not in present:
                     print(f":: unplugged {mice[path].dev.name}", flush=True)
                     mice.pop(path).release()
-            for path in present - set(mice):
-                await adopt(path)
+            rejected.intersection_update(present)   # replug -> fresh examination
+            own.intersection_update(present | {wheel.device.path})
+            for path in present - set(mice) - rejected - own:
+                if not await adopt(path):
+                    rejected.add(path)
             await asyncio.sleep(RESCAN)
 
     async def timebox():

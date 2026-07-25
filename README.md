@@ -108,6 +108,11 @@ exists because its absence shipped and hurt:
   and corrupt SYN framing.
 - **Settle before grab**: libinput needs a beat to open new uinput nodes before
   the real device is grabbed, or early events vanish.
+- **Examine every device path exactly once**: an earlier hotplug scanner reopened
+  all unmanaged `/dev/input/event*` nodes every 2 s — including the daemon's own
+  live uinput nodes, which the compositor was actively reading — and that caused
+  **periodic whole-screen freezes** on KWin + NVIDIA. The rescan now caches
+  examined paths and only ever opens genuinely new (hotplugged) ones.
 - `SIGKILL` is always safe — the kernel drops grabs when the fd closes.
 
 ## Limitations
